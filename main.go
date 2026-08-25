@@ -6,7 +6,7 @@
 //
 // Run on Sys1:
 //
-//	go run ./loadbalancer -listen :8080 \
+//	go run ./loadbalancer -listen :5000 \
 //	    -backends http://SYS2:3210,http://SYS3:3210,http://SYS4:3210
 //
 // Monitoring endpoints:
@@ -245,14 +245,14 @@ func (lb *LoadBalancer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------
 
 func main() {
-	listen := flag.String("listen", ":8080", "address for the load balancer to listen on")
-	backendsRaw := flag.String("backends", "", "comma-separated list of backend URLs, e.g. http://SYS2:3210,http://SYS3:3210")
+	listen := flag.String("listen", ":5000", "address for the load balancer to listen on")
+	backendsRaw := flag.String("backends", "", "comma-separated list of backend URLs, e.g. http://SYS2:4213,http://SYS3:4213")
 	healthInterval := flag.Duration("health-interval", 1*time.Second, "interval between health checks")
 	backendTimeout := flag.Duration("backend-timeout", 800*time.Millisecond, "backend request timeout")
 	flag.Parse()
 
 	if strings.TrimSpace(*backendsRaw) == "" {
-		log.Fatal("must supply -backends, e.g. -backends http://SYS2:3210,http://SYS3:3210")
+		log.Fatal("must supply -backends, e.g. -backends http://SYS2:4213,http://SYS3:4213")
 	}
 
 	lb := &LoadBalancer{}
