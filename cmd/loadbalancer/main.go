@@ -89,12 +89,21 @@ func main() {
 	// or stalled client connection can be held open forever. Under
 	// hundreds or thousands of concurrent clients, that alone can exhaust
 	// file descriptors / goroutines and start refusing new connections.
+	//
+	// WriteTimeout must be large enough to cover a full retry: a safe
+	// (idempotent) request can hit -backend-timeout once, then hit it
+	// again on a second backend, before the load balancer gives up. If
+	// WriteTimeout were shorter than that, the server would sever the
+	// connection mid-retry - which looks like a "context canceled" error
+	// in the logs and needlessly marks a backend unhealthy that might
+	// have been about to succeed.
+	writeTimeout := 2*(*backendTimeout) + 5*time.Second
 	srv := &http.Server{
 		Addr:              listen,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      15 * time.Second,
+		WriteTimeout:      writeTimeout,
 		IdleTimeout:       90 * time.Second,
 	}
 

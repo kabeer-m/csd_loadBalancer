@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"time"
 
 	"loadbalancer/internal/backend"
@@ -104,57 +105,127 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	canRetry := isIdempotent(r.Method) && bufferBody(r, lb.MaxBodyBuf)
-	attempts := 1
-	if canRetry {
-		attempts = 2
+
+	if !canRetry {
+		// Nothing will be retried, so we can write straight to the real
+		// ResponseWriter. This keeps the fast path cheap and preserves
+		// Hijack support (e.g. WebSocket upgrades) for the common case.
+		lb.serveOnce(w, r, start)
+		return
+	}
+	lb.serveWithRetry(w, r, start)
+}
+
+// serveOnce sends the request to exactly one backend and writes its
+// response directly to the real client. Used whenever a retry would be
+// unsafe (e.g. POST) - there's nothing to "undo" if it fails, so there's
+// no need to buffer.
+func (lb *LoadBalancer) serveOnce(w http.ResponseWriter, r *http.Request, start time.Time) {
+	b := lb.pickUntried(nil)
+	if b == nil {
+		lb.Metrics.RecordLatency(time.Since(start))
+		lb.Metrics.Failed.Add(1)
+		http.Error(w, "no healthy backend available", http.StatusServiceUnavailable)
+		return
+	}
+	if !b.TryAdmit() {
+		lb.Metrics.Rejected.Add(1)
+		lb.Metrics.RecordLatency(time.Since(start))
+		lb.Metrics.Failed.Add(1)
+		http.Error(w, "backend is saturated, try again shortly", http.StatusServiceUnavailable)
+		return
 	}
 
-	tried := make(map[*backend.Backend]bool, attempts)
-	var lastStatus int
+	sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+	b.Serve(sw, r)
+	b.Release()
 
-	for attempt := 0; attempt < attempts; attempt++ {
+	lb.Metrics.RecordLatency(time.Since(start))
+	if sw.status < 500 {
+		lb.Metrics.Success.Add(1)
+	} else {
+		lb.Metrics.Failed.Add(1)
+	}
+}
+
+// serveWithRetry is used only for methods that are safe to repeat. An
+// HTTP response can't be taken back once it has been written to the real
+// client connection - so each attempt here is proxied into an in-memory
+// recorder first. Only the attempt we decide to keep is copied to the
+// real ResponseWriter, and it's copied exactly once, no matter how many
+// backends we had to try. This is what a naive retry loop gets wrong: it
+// wraps the *same* real ResponseWriter on every attempt, so a failed
+// first attempt can write a real error response to the client before a
+// second attempt gets a chance - producing two responses on one
+// connection and corrupting whatever request the client sends next on
+// it (visible as "http: superfluous response.WriteHeader call" in the
+// server log).
+func (lb *LoadBalancer) serveWithRetry(w http.ResponseWriter, r *http.Request, start time.Time) {
+	tried := make(map[*backend.Backend]bool, 2)
+	var last *httptest.ResponseRecorder
+	var sawRejection bool
+
+	for attempt := 0; attempt < 2; attempt++ {
 		b := lb.pickUntried(tried)
 		if b == nil {
 			continue
 		}
 
 		if !b.TryAdmit() {
-			// This backend is already at its concurrency cap. Fail this
-			// attempt fast (instead of queuing behind it) so we can try
-			// another backend or return promptly.
 			lb.Metrics.Rejected.Add(1)
-			lastStatus = http.StatusServiceUnavailable
+			sawRejection = true
 			continue
 		}
-
 		tried[b] = true
-		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
-		b.Serve(sw, r)
+
+		rec := httptest.NewRecorder()
+		b.Serve(rec, r)
 		b.Release()
-		lastStatus = sw.status
+		last = rec
+		sawRejection = false
 
-		if sw.status < 500 {
-			lb.Metrics.Success.Add(1)
-			lb.Metrics.RecordLatency(time.Since(start))
-			return
+		if rec.Code < 500 {
+			break // success - stop, we'll flush this one
 		}
-
-		// Only retry on a genuine connection-level failure (marked 502 by
-		// the backend package's ErrorHandler). A backend that is up but
-		// returning its own 5xx is an application bug, not a routing
-		// problem, and retrying it elsewhere wouldn't help.
-		if sw.status != http.StatusBadGateway || !canRetry {
+		if rec.Code != http.StatusBadGateway {
+			// A live backend returned its own real error. That's an
+			// application problem, not a routing one - retrying
+			// elsewhere won't fix it, so stop and report this attempt.
 			break
 		}
+		// rec.Code == 502: a connection-level failure from our own
+		// ErrorHandler. Safe to discard and try the other backend.
 	}
 
 	lb.Metrics.RecordLatency(time.Since(start))
-	lb.Metrics.Failed.Add(1)
-	if lastStatus == 0 || lastStatus == http.StatusServiceUnavailable {
-		http.Error(w, "no healthy backend available", http.StatusServiceUnavailable)
+
+	if last == nil {
+		lb.Metrics.Failed.Add(1)
+		if sawRejection {
+			http.Error(w, "backend is saturated, try again shortly", http.StatusServiceUnavailable)
+		} else {
+			http.Error(w, "no healthy backend available", http.StatusServiceUnavailable)
+		}
+		return
 	}
-	// Otherwise the proxy's ErrorHandler already wrote a response
-	// (e.g. 502) - nothing further to write.
+
+	flushRecorded(w, last)
+	if last.Code < 500 {
+		lb.Metrics.Success.Add(1)
+	} else {
+		lb.Metrics.Failed.Add(1)
+	}
+}
+
+// flushRecorded copies a buffered response to the real ResponseWriter:
+// headers, then status line, then body - in that order, exactly once.
+func flushRecorded(w http.ResponseWriter, rec *httptest.ResponseRecorder) {
+	dst := w.Header()
+	for k, v := range rec.Header() {
+		dst[k] = v
+	}
+	w.WriteHeader(rec.Code)
+	_, _ = io.Copy(w, rec.Body)
 }
 
 // pickUntried calls NextBackend a bounded number of times to avoid
