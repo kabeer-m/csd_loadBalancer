@@ -150,36 +150,3 @@ curl http://localhost:5000/lb/status
 curl http://localhost:5000/lb/metrics
 ```
 
----
-
-## A quick note on "percentiles"
-
-`p50`, `p95`, and `p99` in `/lb/metrics` answer: "how slow was the
-slowest request, for the slowest X% of requests?"
-
-- `p50` = the *typical* response time (half of requests were faster,
-  half slower).
-- `p95` = 95% of requests were faster than this. The remaining 5% were
-  slower — this shows you your "occasional bad experience" number.
-- `p99` = same idea, but for the worst 1%.
-
-Average response time can hide a few very slow requests. Percentiles
-don't — that's why they're worth tracking separately from the average.
-
----
-
-## Why it's split into files this way
-
-The old version of this project was a single 400-line file. That made it
-hard to find anything: scheduling logic, health checks, and the actual
-request handling were all tangled together. Now:
-
-- Want to know how requests are picked? → `internal/lb/lb.go`, ~40 lines.
-- Want to know how health checks work? → `internal/lb/health.go`, ~30
-  lines.
-- Want to know what happens when a request comes in? →
-  `internal/lb/handler.go`.
-
-Each file does one job and is short enough to read in a couple of
-minutes, which makes debugging much faster: you already know which file
-the bug has to be in before you even open an editor.
