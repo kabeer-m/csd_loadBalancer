@@ -7,14 +7,11 @@
 package lb
 
 import (
-	"sync/atomic"
-
 	"loadbalancer/internal/backend"
 	"loadbalancer/internal/metrics"
 )
 
-// LoadBalancer holds the backend pool, the round-robin cursor, and the
-// shared metrics all requests get recorded into.
+// LoadBalancer holds the backend pool and shared request metrics.
 type LoadBalancer struct {
 	Backends []*backend.Backend
 	Metrics  *metrics.Metrics
@@ -22,8 +19,6 @@ type LoadBalancer struct {
 	// MaxBodyBuf caps how large a request body we'll buffer in memory to
 	// allow a retry against a second backend. See handler.go.
 	MaxBodyBuf int
-
-	next atomic.Uint64
 }
 
 // New builds a LoadBalancer over an already-constructed set of backends.
@@ -35,29 +30,41 @@ func New(backends []*backend.Backend, m *metrics.Metrics, maxBodyBuf int) *LoadB
 	}
 }
 
-// NextBackend implements round-robin scheduling, skipping backends
-// currently marked unhealthy. lb.next is an atomic counter shared by every
-// goroutine handling a request concurrently: each call to Add(1) hands out
-// a distinct, ever-increasing ticket with no lock required, and %n maps
-// that ticket into the backend array, cycling 0..n-1 forever.
-//
-// If every backend looks unhealthy, we still return one instead of nil -
-// a single bad health probe shouldn't permanently blackhole a backend
-// that a real request might succeed against.
+// NextBackend returns the healthy backend with the fewest currently admitted
+// requests. With only a few backends, a linear scan is cheaper and simpler
+// than maintaining a separate heap or queue.
 func (lb *LoadBalancer) NextBackend() *backend.Backend {
-	n := len(lb.Backends)
-	if n == 0 {
+	if len(lb.Backends) == 0 {
 		return nil
 	}
 
-	for i := 0; i < n; i++ {
-		index := lb.next.Add(1) % uint64(n)
-		b := lb.Backends[index]
-		if b.Alive.Load() {
-			return b
+	var best *backend.Backend
+	bestLoad := int(^uint(0) >> 1)
+
+	for _, b := range lb.Backends {
+		if !b.Alive.Load() {
+			continue
+		}
+		load := b.InFlight()
+		if best == nil || load < bestLoad {
+			best = b
+			bestLoad = load
 		}
 	}
 
-	index := lb.next.Add(1) % uint64(n)
-	return lb.Backends[index]
+	// If health checking has temporarily marked every backend unhealthy,
+	// still allow one request through rather than blackholing the whole pool.
+	if best != nil {
+		return best
+	}
+
+	best = lb.Backends[0]
+	bestLoad = best.InFlight()
+	for _, b := range lb.Backends[1:] {
+		if load := b.InFlight(); load < bestLoad {
+			best = b
+			bestLoad = load
+		}
+	}
+	return best
 }

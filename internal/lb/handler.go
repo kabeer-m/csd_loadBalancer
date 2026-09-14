@@ -104,7 +104,7 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	canRetry := isIdempotent(r.Method) && bufferBody(r, lb.MaxBodyBuf)
+	canRetry := isIdempotent(r.Method) && r.URL.Path != "/feed" && bufferBody(r, lb.MaxBodyBuf)
 
 	if !canRetry {
 		// Nothing will be retried, so we can write straight to the real
@@ -121,15 +121,23 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // unsafe (e.g. POST) - there's nothing to "undo" if it fails, so there's
 // no need to buffer.
 func (lb *LoadBalancer) serveOnce(w http.ResponseWriter, r *http.Request, start time.Time) {
-	b := lb.pickUntried(nil)
-	if b == nil {
-		lb.Metrics.RecordLatency(time.Since(start))
-		lb.Metrics.Failed.Add(1)
-		http.Error(w, "no healthy backend available", http.StatusServiceUnavailable)
-		return
-	}
-	if !b.TryAdmit() {
+	tried := make(map[*backend.Backend]bool, len(lb.Backends))
+	var admitted *backend.Backend
+
+	for i := 0; i < len(lb.Backends); i++ {
+		b := lb.pickUntried(tried)
+		if b == nil {
+			break
+		}
+		tried[b] = true
+		if b.TryAdmit() {
+			admitted = b
+			break
+		}
 		lb.Metrics.Rejected.Add(1)
+	}
+
+	if admitted == nil {
 		lb.Metrics.RecordLatency(time.Since(start))
 		lb.Metrics.Failed.Add(1)
 		http.Error(w, "backend is saturated, try again shortly", http.StatusServiceUnavailable)
@@ -137,8 +145,8 @@ func (lb *LoadBalancer) serveOnce(w http.ResponseWriter, r *http.Request, start 
 	}
 
 	sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
-	b.Serve(sw, r)
-	b.Release()
+	admitted.Serve(sw, r)
+	admitted.Release()
 
 	lb.Metrics.RecordLatency(time.Since(start))
 	if sw.status < 500 {

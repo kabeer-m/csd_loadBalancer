@@ -1,5 +1,5 @@
 // Command loadbalancer runs a reverse-proxy load balancer with
-// round-robin scheduling, active health checks, backpressure, and
+// least-in-flight scheduling, active health checks, backpressure, and
 // metrics. All the actual logic lives in the internal/ packages; this
 // file's only job is reading configuration and wiring the pieces
 // together, which is what makes it worth reading top to bottom in one
@@ -15,7 +15,7 @@
 //	GET /lb/health   -> is the LB itself alive
 //	GET /lb/status   -> per-backend health/state
 //	GET /lb/metrics  -> counters + latency summary
-//	*   /            -> proxied to a healthy backend (round robin)
+//	*   /            -> proxied to a healthy backend (least-in-flight)
 package main
 
 import (
@@ -38,7 +38,7 @@ func main() {
 	backendsRaw := flag.String("backends", "", "comma-separated list of backend URLs, e.g. http://SYS2:3210,http://SYS3:3210")
 	healthInterval := flag.Duration("health-interval", 1*time.Second, "interval between health checks")
 	backendTimeout := flag.Duration("backend-timeout", 10*time.Second, "max time to wait for a backend's response headers")
-	maxInFlightPerBackend := flag.Int("max-inflight-per-backend", 500, "max concurrent requests allowed to a single backend before it is treated as saturated")
+	maxInFlightPerBackend := flag.Int("max-inflight-per-backend", 100, "max concurrent requests allowed to a single backend")
 	maxBodyBuf := flag.Int("max-retry-body-bytes", 1<<20, "largest request body (bytes) the LB will buffer to allow a retry on a different backend")
 	flag.Parse()
 
@@ -54,12 +54,13 @@ func main() {
 	// request open forever.
 	transport := &http.Transport{
 		DialContext: (&net.Dialer{
-			Timeout:   5 * time.Second,
+			Timeout:   2 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
-		MaxIdleConns:          10000,
-		MaxIdleConnsPerHost:   2000,
-		IdleConnTimeout:       90 * time.Second,
+		MaxConnsPerHost:       100,
+		MaxIdleConns:          300,
+		MaxIdleConnsPerHost:   100,
+		IdleConnTimeout:       30 * time.Second,
 		ResponseHeaderTimeout: *backendTimeout,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
