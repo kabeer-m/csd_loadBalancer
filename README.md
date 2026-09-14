@@ -90,14 +90,63 @@ status code below 500 when it's OK.
 
 ### 1. Picking who gets the next request (`lb.go`)
 
-This uses **round robin**: request 1 goes to backend A, request 2 to
-backend B, request 3 to backend C, request 4 back to A, and so on. It's
-like dealing cards one at a time to each player in turn.
+This uses **least-in-flight**: every time a new request arrives, the load
+balancer looks at how many requests are currently being handled by each
+backend, and sends the new one to whichever backend has the fewest. It's
+like a supermarket checkout — you join the shortest queue, not the next
+one in rotation.
 
 If a backend is currently marked unhealthy, it gets skipped. If *every*
 backend looks unhealthy (maybe the health check was just unlucky), we
 still send the request somewhere rather than refuse it outright — one
 bad health check shouldn't shut everything down.
+
+---
+
+## Scheduling algorithm
+
+The scheduler lives in `internal/lb/lb.go` inside `NextBackend()`.
+
+**Algorithm: Least-In-Flight**
+
+Each backend tracks how many requests are currently admitted to it (its
+"in-flight" count). When a new request arrives, `NextBackend` does a
+single linear scan over all backends and picks the one with the lowest
+in-flight count, skipping any that are marked unhealthy.
+
+```
+for each healthy backend:
+    if backend.InFlight() < current best:
+        best = backend
+return best
+```
+
+Why this instead of round robin or random?
+
+- **Round robin** hands requests out evenly by turn, but ignores the fact
+  that some requests take much longer than others. If backend A is stuck
+  on a slow database query, round robin will keep sending it new work
+  anyway.
+
+- **Least-in-flight** naturally accounts for speed differences. A fast
+  backend finishes requests quickly, so its count stays low and it keeps
+  getting more work. A slow or busy backend accumulates a higher count
+  and gets fewer new requests until it catches up. No configuration
+  needed — it adjusts by itself.
+
+- **Why a linear scan?** With a small number of backends (typically 2–10),
+  scanning every backend on every request is faster in practice than
+  maintaining a sorted heap or priority queue. There's no lock contention
+  on the list itself, and the in-flight count is read from a channel's
+  `len()` which is a single memory read.
+
+**Fallback when all backends are unhealthy**
+
+If the health loop has temporarily marked every backend as unhealthy, the
+scheduler doesn't refuse the request outright. It falls back to a second
+scan over *all* backends (ignoring the alive flag) and still picks the
+one with the lowest in-flight count. One bad sweep of health checks
+shouldn't bring the whole system down.
 
 ### 2. Checking who's healthy (`health.go`)
 
