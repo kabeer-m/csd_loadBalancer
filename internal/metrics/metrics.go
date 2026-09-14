@@ -1,8 +1,4 @@
-// Package metrics owns everything about counting what the load balancer
-// has done: request counts, and a rolling window of latencies used to
-// compute percentiles. Nothing in this package knows what a "backend" or
-// a "request" looks like beyond a duration and a pass/fail outcome - that
-// separation is what makes it independently testable.
+// Package metrics tracks request counts and a rolling latency window.
 package metrics
 
 import (
@@ -12,33 +8,30 @@ import (
 	"time"
 )
 
-// maxSamples caps how many latency samples we keep in memory. Without a
-// cap, a long-running process would grow this slice forever.
+// maxSamples caps the number of latency samples kept in memory.
 const maxSamples = 50000
 
-// Metrics stores counters for everything the LB has done. The atomic
-// counters can be incremented directly (they are safe for concurrent use
-// on their own); the latency slice needs its own lock because "append and
-// possibly truncate" is not a single atomic operation.
+// Metrics stores counters and latency samples for the load balancer.
+// Atomic counters are safe to increment directly; the latency slice
+// is guarded by mu.
 type Metrics struct {
 	Total         atomic.Uint64
 	Success       atomic.Uint64
 	Failed        atomic.Uint64
 	BackendErrors atomic.Uint64
-	Rejected      atomic.Uint64 // requests turned away because every backend was saturated
+	Rejected      atomic.Uint64
 
 	mu        sync.Mutex
 	latencies []time.Duration
 }
 
-// New returns a ready-to-use, zeroed Metrics.
+// New returns a zeroed Metrics.
 func New() *Metrics {
 	return &Metrics{}
 }
 
-// RecordLatency appends one latency sample, trimming the oldest samples
-// once the window is full (a simple fixed-size ring, implemented as a
-// slice that drops its head).
+// RecordLatency appends a latency sample, dropping the oldest once the
+// window is full.
 func (m *Metrics) RecordLatency(d time.Duration) {
 	m.mu.Lock()
 	m.latencies = append(m.latencies, d)
@@ -48,9 +41,7 @@ func (m *Metrics) RecordLatency(d time.Duration) {
 	m.mu.Unlock()
 }
 
-// percentile returns the value at rank p (0.0-1.0) in an already-sorted
-// slice. This is "nearest-rank" percentile estimation - simple, and
-// accurate enough for operational dashboards.
+// percentile returns the value at rank p (0.0–1.0) in a sorted slice.
 func percentile(sorted []time.Duration, p float64) time.Duration {
 	if len(sorted) == 0 {
 		return 0
@@ -65,8 +56,7 @@ func percentile(sorted []time.Duration, p float64) time.Duration {
 	return sorted[idx]
 }
 
-// Snapshot is a point-in-time, JSON-friendly view of the metrics, safe to
-// hand to an HTTP handler without exposing the internal lock or slice.
+// Snapshot is a point-in-time JSON-friendly view of the metrics.
 type Snapshot struct {
 	Total         uint64  `json:"total"`
 	Success       uint64  `json:"success"`
@@ -78,9 +68,7 @@ type Snapshot struct {
 	P99Ms         float64 `json:"p99_ms"`
 }
 
-// Snapshot copies the current latency samples out from under the lock,
-// sorts the copy (never the live slice - sorting in place while another
-// goroutine appends would be a data race), and computes percentiles.
+// Snapshot returns a consistent point-in-time snapshot with latency percentiles.
 func (m *Metrics) Snapshot() Snapshot {
 	m.mu.Lock()
 	latencies := make([]time.Duration, len(m.latencies))
@@ -102,3 +90,4 @@ func (m *Metrics) Snapshot() Snapshot {
 		P99Ms:         ms(percentile(latencies, 0.99)),
 	}
 }
+

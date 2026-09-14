@@ -1,8 +1,5 @@
 // Package backend represents a single downstream server the load balancer
-// can forward traffic to. It owns the reverse proxy plumbing (so callers
-// never touch httputil directly) and a concurrency limiter, so the rest
-// of the codebase just sees "a thing I can ask to admit or serve a
-// request" without caring how that's implemented underneath.
+// can forward traffic to.
 package backend
 
 import (
@@ -23,30 +20,20 @@ type Backend struct {
 	admit chan struct{} // counting semaphore: one slot per in-flight request
 }
 
-// Config groups everything New needs to build a Backend, so the
-// constructor signature doesn't grow every time we add a knob.
+// Config groups the options for New.
 type Config struct {
-	// Transport is shared across all backends so their connections come
-	// from one pooled http.Transport instead of each backend paying for
-	// its own dial/keep-alive pool.
+	// Transport is shared across all backends so they use one connection pool.
 	Transport http.RoundTripper
 
-	// MaxInFlight bounds how many requests may be sent to this backend at
-	// once. Once full, TryAdmit returns false so the caller can fail fast
-	// or try a different backend, instead of queuing indefinitely.
+	// MaxInFlight bounds concurrent requests to this backend.
+	// TryAdmit returns false when the limit is reached.
 	MaxInFlight int
 
-	// OnError is called whenever a request to this backend fails at the
-	// connection level (refused, reset, timed out) - as opposed to the
-	// backend replying with its own HTTP error status. The backend
-	// package doesn't know about metrics; it just reports the fact.
+	// OnError is called on connection-level failures (refused, reset, timeout).
 	OnError func(b *Backend, err error)
 }
 
-// New parses rawURL and builds a Backend with its own reverse proxy
-// wired up: connection pooling via the shared Transport, a corrected
-// Host header (see below), and error handling that marks the backend
-// unhealthy on a connection failure.
+// New parses rawURL and returns a Backend with a reverse proxy configured.
 func New(rawURL string, cfg Config) (*Backend, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -61,26 +48,20 @@ func New(rawURL string, cfg Config) (*Backend, error) {
 		URL:   u,
 		admit: make(chan struct{}, cfg.MaxInFlight),
 	}
-	b.Alive.Store(true) // optimistic; the health loop corrects this quickly
+	b.Alive.Store(true) // optimistic; health loop corrects this quickly
 
 	proxy := httputil.NewSingleHostReverseProxy(u)
 	proxy.Transport = cfg.Transport
 
-	// NewSingleHostReverseProxy rewrites the scheme/host/path used to make
-	// the *connection*, but leaves the Host *header* on the wire as
-	// whatever the original client sent. Any backend that validates or
-	// routes on Host (or sits behind its own vhost setup) would otherwise
-	// reject or mis-route every single request. Fixing this here means
-	// every caller of this package gets it for free.
-	originalDirector := proxy.Director
+	// Fix the Host header so backends that validate it see their own host,
+	// not the client's original host.
+	orig := proxy.Director
 	proxy.Director = func(req *http.Request) {
-		originalDirector(req)
+		orig(req)
 		req.Host = u.Host
 	}
 
 	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
-		// A single overloaded/slow request must not immediately evict the backend.
-		// HealthLoop owns health state and applies hysteresis to avoid flapping.
 		if cfg.OnError != nil {
 			cfg.OnError(b, err)
 		}
@@ -91,10 +72,8 @@ func New(rawURL string, cfg Config) (*Backend, error) {
 	return b, nil
 }
 
-// TryAdmit reserves one concurrency slot without blocking. It returns
-// false immediately if the backend is already at MaxInFlight, which is
-// what lets the load balancer fail fast instead of letting requests pile
-// up behind an overloaded backend.
+// TryAdmit reserves one concurrency slot without blocking.
+// Returns false if the backend is already at MaxInFlight.
 func (b *Backend) TryAdmit() bool {
 	select {
 	case b.admit <- struct{}{}:
@@ -104,14 +83,12 @@ func (b *Backend) TryAdmit() bool {
 	}
 }
 
-// Release frees one concurrency slot. Must be called exactly once for
-// every successful TryAdmit.
+// Release frees one concurrency slot. Must be called once per successful TryAdmit.
 func (b *Backend) Release() {
 	<-b.admit
 }
 
-// InFlight reports how many requests are currently admitted. It is also
-// used by the least-in-flight scheduler.
+// InFlight returns the number of currently admitted requests.
 func (b *Backend) InFlight() int {
 	return len(b.admit)
 }
@@ -121,7 +98,8 @@ func (b *Backend) Serve(w http.ResponseWriter, r *http.Request) {
 	b.proxy.ServeHTTP(w, r)
 }
 
-// HealthURL returns the address the health checker should probe.
+// HealthURL returns the URL the health checker should probe.
 func (b *Backend) HealthURL() string {
 	return strings.TrimRight(b.URL.String(), "/") + "/health"
 }
+

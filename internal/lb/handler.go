@@ -13,26 +13,21 @@ import (
 	"loadbalancer/internal/backend"
 )
 
-// bufferBody reads r.Body into memory (up to maxBytes) so the same
-// request can be replayed against a second backend if the first attempt
-// fails at the connection level. An http.Request's Body can only be read
-// once, so without this, any retry would send an empty body. Returns
-// false if the body was too large to safely buffer - in which case the
-// caller should not attempt a retry for this request.
-func bufferBody(r *http.Request, maxBytes int) (ok bool) {
+// bufferBody reads r.Body into memory (up to maxBytes) so the request can be
+// replayed against a second backend on failure. Returns false if the body
+// exceeds maxBytes, in which case a retry is unsafe.
+func bufferBody(r *http.Request, maxBytes int) bool {
 	if r.Body == nil || r.ContentLength == 0 {
 		return true
 	}
-	limited := io.LimitReader(r.Body, int64(maxBytes)+1)
-	data, err := io.ReadAll(limited)
+	data, err := io.ReadAll(io.LimitReader(r.Body, int64(maxBytes)+1))
 	r.Body.Close()
 	if err != nil {
 		return false
 	}
 	if len(data) > maxBytes {
-		// Too large to buffer for a retry. Restore what we already read
-		// so the single attempt we do make still gets the full body.
-		r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(data), r.Body))
+		// Body too large to buffer; restore what we read for the single attempt.
+		r.Body = io.NopCloser(bytes.NewReader(data))
 		return false
 	}
 	r.Body = io.NopCloser(bytes.NewReader(data))
@@ -42,10 +37,9 @@ func bufferBody(r *http.Request, maxBytes int) (ok bool) {
 	return true
 }
 
-// isIdempotent reports whether a method is safe to retry against a second
-// backend. POST is deliberately excluded: if the first attempt actually
-// reached the backend and only the reply was lost, retrying it elsewhere
-// could store the same submission twice.
+// isIdempotent reports whether the method is safe to retry on a second backend.
+// POST is excluded because a successful-but-lost reply could mean the action
+// already happened.
 func isIdempotent(method string) bool {
 	switch method {
 	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodPut, http.MethodDelete:
@@ -55,9 +49,7 @@ func isIdempotent(method string) bool {
 	}
 }
 
-// statusWriter wraps a ResponseWriter so we can observe the status code a
-// backend's response used, since http.ResponseWriter doesn't expose it
-// after the fact.
+// statusWriter wraps ResponseWriter to capture the status code after the fact.
 type statusWriter struct {
 	http.ResponseWriter
 	status      int
@@ -80,20 +72,18 @@ func (sw *statusWriter) Write(b []byte) (int, error) {
 	return sw.ResponseWriter.Write(b)
 }
 
-// Hijack lets a WebSocket (or other protocol-upgrading) connection reach
-// the raw TCP socket through our wrapper, if the underlying writer
-// supports it.
+// Hijack passes WebSocket (or other protocol-upgrade) connections through
+// to the underlying ResponseWriter.
 func (sw *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	hijacker, ok := sw.ResponseWriter.(http.Hijacker)
+	h, ok := sw.ResponseWriter.(http.Hijacker)
 	if !ok {
 		return nil, nil, fmt.Errorf("underlying ResponseWriter does not support hijacking")
 	}
-	return hijacker.Hijack()
+	return h.Hijack()
 }
 
-// ServeHTTP picks a backend and proxies the request to it, applying
-// backpressure (fail fast instead of queuing indefinitely) and retrying
-// once against a different backend when it's safe to do so.
+// ServeHTTP picks a backend and proxies the request, applying backpressure and
+// retrying once on a different backend when safe.
 func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	lb.Metrics.Total.Add(1)
 	start := time.Now()
@@ -104,27 +94,20 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	canRetry := isIdempotent(r.Method) && r.URL.Path != "/feed" && bufferBody(r, lb.MaxBodyBuf)
-
-	if !canRetry {
-		// Nothing will be retried, so we can write straight to the real
-		// ResponseWriter. This keeps the fast path cheap and preserves
-		// Hijack support (e.g. WebSocket upgrades) for the common case.
+	if isIdempotent(r.Method) && r.URL.Path != "/feed" && bufferBody(r, lb.MaxBodyBuf) {
+		lb.serveWithRetry(w, r, start)
+	} else {
 		lb.serveOnce(w, r, start)
-		return
 	}
-	lb.serveWithRetry(w, r, start)
 }
 
-// serveOnce sends the request to exactly one backend and writes its
-// response directly to the real client. Used whenever a retry would be
-// unsafe (e.g. POST) - there's nothing to "undo" if it fails, so there's
-// no need to buffer.
+// serveOnce sends the request to one backend and writes directly to the client.
+// Used for non-retryable requests (e.g. POST).
 func (lb *LoadBalancer) serveOnce(w http.ResponseWriter, r *http.Request, start time.Time) {
 	tried := make(map[*backend.Backend]bool, len(lb.Backends))
 	var admitted *backend.Backend
 
-	for i := 0; i < len(lb.Backends); i++ {
+	for range lb.Backends {
 		b := lb.pickUntried(tried)
 		if b == nil {
 			break
@@ -156,18 +139,9 @@ func (lb *LoadBalancer) serveOnce(w http.ResponseWriter, r *http.Request, start 
 	}
 }
 
-// serveWithRetry is used only for methods that are safe to repeat. An
-// HTTP response can't be taken back once it has been written to the real
-// client connection - so each attempt here is proxied into an in-memory
-// recorder first. Only the attempt we decide to keep is copied to the
-// real ResponseWriter, and it's copied exactly once, no matter how many
-// backends we had to try. This is what a naive retry loop gets wrong: it
-// wraps the *same* real ResponseWriter on every attempt, so a failed
-// first attempt can write a real error response to the client before a
-// second attempt gets a chance - producing two responses on one
-// connection and corrupting whatever request the client sends next on
-// it (visible as "http: superfluous response.WriteHeader call" in the
-// server log).
+// serveWithRetry proxies idempotent requests through an in-memory recorder so
+// that a failed first attempt can be discarded and retried on a second backend
+// without writing any partial response to the client.
 func (lb *LoadBalancer) serveWithRetry(w http.ResponseWriter, r *http.Request, start time.Time) {
 	tried := make(map[*backend.Backend]bool, 2)
 	var last *httptest.ResponseRecorder
@@ -178,7 +152,6 @@ func (lb *LoadBalancer) serveWithRetry(w http.ResponseWriter, r *http.Request, s
 		if b == nil {
 			continue
 		}
-
 		if !b.TryAdmit() {
 			lb.Metrics.Rejected.Add(1)
 			sawRejection = true
@@ -193,16 +166,13 @@ func (lb *LoadBalancer) serveWithRetry(w http.ResponseWriter, r *http.Request, s
 		sawRejection = false
 
 		if rec.Code < 500 {
-			break // success - stop, we'll flush this one
+			break // success
 		}
 		if rec.Code != http.StatusBadGateway {
-			// A live backend returned its own real error. That's an
-			// application problem, not a routing one - retrying
-			// elsewhere won't fix it, so stop and report this attempt.
+			// Backend returned its own error; retrying elsewhere won't help.
 			break
 		}
-		// rec.Code == 502: a connection-level failure from our own
-		// ErrorHandler. Safe to discard and try the other backend.
+		// 502 means our ErrorHandler fired (connection failure) — safe to retry.
 	}
 
 	lb.Metrics.RecordLatency(time.Since(start))
@@ -225,8 +195,7 @@ func (lb *LoadBalancer) serveWithRetry(w http.ResponseWriter, r *http.Request, s
 	}
 }
 
-// flushRecorded copies a buffered response to the real ResponseWriter:
-// headers, then status line, then body - in that order, exactly once.
+// flushRecorded copies a buffered response to the real ResponseWriter.
 func flushRecorded(w http.ResponseWriter, rec *httptest.ResponseRecorder) {
 	dst := w.Header()
 	for k, v := range rec.Header() {
@@ -236,8 +205,8 @@ func flushRecorded(w http.ResponseWriter, rec *httptest.ResponseRecorder) {
 	_, _ = io.Copy(w, rec.Body)
 }
 
-// pickUntried calls NextBackend a bounded number of times to avoid
-// picking a backend we've already tried in this request's retry loop.
+// pickUntried returns the next backend from the scheduler that hasn't been
+// tried yet in this request's loop.
 func (lb *LoadBalancer) pickUntried(tried map[*backend.Backend]bool) *backend.Backend {
 	n := len(lb.Backends)
 	b := lb.NextBackend()
@@ -249,3 +218,4 @@ func (lb *LoadBalancer) pickUntried(tried map[*backend.Backend]bool) *backend.Ba
 	}
 	return b
 }
+

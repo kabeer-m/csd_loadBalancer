@@ -14,8 +14,8 @@ const (
 	healthSuccessThreshold = 2
 )
 
-// HealthLoop probes every backend concurrently and uses hysteresis so a
-// single transient timeout does not flap a backend in and out of rotation.
+// HealthLoop probes every backend concurrently on each tick and applies
+// hysteresis to avoid flapping on transient failures.
 func (lb *LoadBalancer) HealthLoop(interval time.Duration) {
 	client := &http.Client{Timeout: 1 * time.Second}
 	failures := make(map[int]int)
@@ -35,14 +35,12 @@ func (lb *LoadBalancer) HealthLoop(interval time.Duration) {
 			wg.Add(1)
 			go func(i int, b *backend.Backend) {
 				defer wg.Done()
-
 				resp, err := client.Get(b.HealthURL())
 				alive := err == nil && resp != nil && resp.StatusCode < 500
 				if resp != nil {
 					resp.Body.Close()
 				}
-
-				results <- result{index: i, alive: alive}
+				results <- result{i, alive}
 			}(i, b)
 		}
 
@@ -73,8 +71,7 @@ func (lb *LoadBalancer) HealthLoop(interval time.Duration) {
 				}
 			}
 
-			nowAlive := b.Alive.Load()
-			if nowAlive != wasAlive {
+			if nowAlive := b.Alive.Load(); nowAlive != wasAlive {
 				state := "UNHEALTHY"
 				if nowAlive {
 					state = "ALIVE"
@@ -93,3 +90,4 @@ func (lb *LoadBalancer) HealthLoop(interval time.Duration) {
 		check()
 	}
 }
+
