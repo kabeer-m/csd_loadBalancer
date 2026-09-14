@@ -79,7 +79,8 @@ func New(rawURL string, cfg Config) (*Backend, error) {
 	}
 
 	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
-		b.Alive.Store(false)
+		// A single overloaded/slow request must not immediately evict the backend.
+		// HealthLoop owns health state and applies hysteresis to avoid flapping.
 		if cfg.OnError != nil {
 			cfg.OnError(b, err)
 		}
@@ -109,8 +110,8 @@ func (b *Backend) Release() {
 	<-b.admit
 }
 
-// InFlight reports how many requests are currently admitted - useful for
-// a /status endpoint, not used for scheduling decisions here.
+// InFlight reports how many requests are currently admitted. It is also
+// used by the least-in-flight scheduler.
 func (b *Backend) InFlight() int {
 	return len(b.admit)
 }
